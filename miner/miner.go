@@ -32,6 +32,7 @@ type Miner struct {
 	shareTarget  atomic.Pointer[[32]byte]
 	enonce2Seq   atomic.Uint64
 	hashes       atomic.Uint64
+	enabled      atomic.Bool
 
 	shares chan stratum.Share
 
@@ -40,17 +41,28 @@ type Miner struct {
 	wg       sync.WaitGroup
 }
 
-// New constructs a Miner; call Run to spawn workers.
+// New constructs a Miner; call Run to spawn workers. Miners start enabled;
+// SetEnabled toggles whether workers consume CPU.
 func New(cfg Config) *Miner {
 	if cfg.Threads < 1 {
 		cfg.Threads = 1
 	}
-	return &Miner{
+	m := &Miner{
 		threads: cfg.Threads,
 		shares:  make(chan stratum.Share, 16),
 		stopCh:  make(chan struct{}),
 	}
+	m.enabled.Store(true)
+	return m
 }
+
+// SetEnabled toggles whether workers are actively hashing. While disabled,
+// workers sleep in a low-cost poll loop; the stratum connection is unaffected.
+// Used by --mode=auto to pause mining when no dev tool is detected.
+func (m *Miner) SetEnabled(on bool) { m.enabled.Store(on) }
+
+// Enabled reports the current mining gate state.
+func (m *Miner) Enabled() bool { return m.enabled.Load() }
 
 // SetJob installs a new job. Workers pick it up at the next batch boundary.
 func (m *Miner) SetJob(j *stratum.Job) { m.job.Store(j) }
@@ -96,12 +108,13 @@ func (m *Miner) workerLoop() {
 
 		j := m.job.Load()
 		tp := m.shareTarget.Load()
-		if j == nil || tp == nil {
-			// Pool hasn't delivered the first job or target yet. Wait briefly.
+		if j == nil || tp == nil || !m.enabled.Load() {
+			// Either the pool hasn't delivered the first job/target yet, or
+			// auto-pair has disabled mining. Poll cheaply.
 			select {
 			case <-m.stopCh:
 				return
-			case <-time.After(50 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):
 			}
 			continue
 		}
@@ -126,7 +139,7 @@ func (m *Miner) hashSweep(j *stratum.Job, target [32]byte, enonce2 []byte) {
 			return
 		default:
 		}
-		if m.job.Load() != j {
+		if m.job.Load() != j || !m.enabled.Load() {
 			return
 		}
 

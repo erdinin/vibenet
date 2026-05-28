@@ -16,11 +16,13 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"vibenet/miner"
+	"vibenet/pair"
 	"vibenet/stratum"
 )
 
@@ -45,7 +47,15 @@ func main() {
 	worker := flag.String("worker", "rig-01", "Worker name (free-form identifier)")
 	threads := flag.Int("threads", runtime.NumCPU(), "Number of mining goroutines")
 	pool := flag.String("pool", defaultPool, "Stratum endpoint (host:port)")
+	mode := flag.String("mode", "auto", "Mining gate: auto (pair with active dev tools) | always | off")
 	flag.Parse()
+
+	switch *mode {
+	case "auto", "always", "off":
+	default:
+		fmt.Fprintf(os.Stderr, "error: --mode must be auto, always, or off (got %q)\n", *mode)
+		os.Exit(2)
+	}
 
 	if *wallet == "" {
 		fmt.Fprintln(os.Stderr, "error: --wallet is required")
@@ -59,6 +69,7 @@ func main() {
 	fmt.Printf("   \033[1mWorker \033[0m  %s\n", *worker)
 	fmt.Printf("   \033[1mThreads\033[0m  %d\n", *threads)
 	fmt.Printf("   \033[1mPool   \033[0m  %s\n", *pool)
+	fmt.Printf("   \033[1mMode   \033[0m  %s\n", *mode)
 	fmt.Println("   ────────────────────────────────────────────────────────")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -94,8 +105,12 @@ func main() {
 	// Pull shares from the miner, submit to the pool.
 	go submitShares(ctx, client, m, user, &accepted, &rejected)
 
+	// Mode-driven gate: pair detection feeds m.SetEnabled().
+	var pairStatus atomic.Pointer[string]
+	go gateMiner(ctx, m, *mode, &pairStatus)
+
 	// Live status reporter.
-	go report(ctx, m, *worker, client, &accepted, &rejected)
+	go report(ctx, m, *worker, *mode, client, &accepted, &rejected, &pairStatus)
 
 	// Drive the miner.
 	minerDone := make(chan struct{})
@@ -176,7 +191,56 @@ func submitShares(ctx context.Context, c *stratum.Client, m *miner.Miner, user s
 	}
 }
 
-func report(ctx context.Context, m *miner.Miner, worker string, c *stratum.Client, accepted, rejected *atomic.Uint64) {
+// gateMiner controls the miner's hashing gate according to --mode:
+//   - always: enabled forever
+//   - off:    disabled forever
+//   - auto:   polls pair detection every 5 s; enabled iff a dev tool is running
+func gateMiner(ctx context.Context, m *miner.Miner, mode string, status *atomic.Pointer[string]) {
+	switch mode {
+	case "always":
+		m.SetEnabled(true)
+		setPairStatus(status, "always-on")
+		return
+	case "off":
+		m.SetEnabled(false)
+		setPairStatus(status, "paused (mode=off)")
+		return
+	}
+
+	det := pair.New(pair.LoadUserOverrides())
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	check := func() {
+		paired, matched, err := det.IsPaired()
+		if err != nil {
+			setPairStatus(status, "pair check failed: "+err.Error())
+			m.SetEnabled(false)
+			return
+		}
+		if paired {
+			m.SetEnabled(true)
+			setPairStatus(status, "paired with "+strings.Join(matched, ", "))
+		} else {
+			m.SetEnabled(false)
+			setPairStatus(status, "sleeping (no dev tools)")
+		}
+	}
+
+	check() // immediate first poll so the first report tick has fresh data
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check()
+		}
+	}
+}
+
+func setPairStatus(p *atomic.Pointer[string], s string) { p.Store(&s) }
+
+func report(ctx context.Context, m *miner.Miner, worker, mode string, c *stratum.Client, accepted, rejected *atomic.Uint64, pairStatus *atomic.Pointer[string]) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -193,13 +257,19 @@ func report(ctx context.Context, m *miner.Miner, worker string, c *stratum.Clien
 			rate := float64(cur-lastHashes) / now.Sub(lastTime).Seconds()
 			uptime := time.Since(start).Round(time.Second)
 
-			fmt.Printf("\r   \033[36m⛏\033[0m  [\033[1m%s\033[0m]  \033[32m%s\033[0m  │  shares \033[1m%d\033[0m/\033[90m%d\033[0m  │  diff \033[90m%.3f\033[0m  │  up \033[90m%s\033[0m     ",
+			status := ""
+			if p := pairStatus.Load(); p != nil {
+				status = *p
+			}
+
+			fmt.Printf("\r   \033[36m⛏\033[0m  [\033[1m%s\033[0m]  \033[32m%s\033[0m  │  shares \033[1m%d\033[0m/\033[90m%d\033[0m  │  diff \033[90m%.3f\033[0m  │  up \033[90m%s\033[0m  │  \033[90m%s\033[0m     ",
 				worker,
 				miner.FormatHashrate(rate),
 				accepted.Load(),
 				rejected.Load(),
 				c.CurrentDifficulty(),
 				uptime,
+				status,
 			)
 
 			lastHashes = cur
