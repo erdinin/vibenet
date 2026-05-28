@@ -12,10 +12,13 @@ This is genuine solo mining. Your hashpower is not pooled with anyone else's; on
 
 ## Quick start
 
+Download the binary for your OS/arch from the [Releases page](https://github.com/erdinin/vibenet/releases) (Linux / macOS / Windows · amd64 + arm64) and run:
+
 ```sh
-# Pre-built binaries (Windows / Linux / macOS) will be published in Releases.
-./vibenet --wallet bc1qexampleaddressxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --worker rig-01
+./vibenet --wallet bc1q...your-btc-address
 ```
+
+That's it. No account, no signup, no config file. The Stratum username sent to the pool is `<wallet>.<worker>`; payouts go directly to `<wallet>`.
 
 **Required:**
 

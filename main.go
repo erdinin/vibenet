@@ -27,10 +27,15 @@ import (
 )
 
 const (
-	defaultPool  = "solo.ckpool.org:3333"
-	userAgent    = "VibeNet/0.1.0"
-	stratumPass  = "x"
+	defaultPool = "solo.ckpool.org:3333"
+	stratumPass = "x"
 )
+
+// version is injected at build time via -ldflags "-X main.version=...".
+// Release builds get the git tag; ad-hoc go-build leaves it as "dev".
+var version = "dev"
+
+func userAgent() string { return "VibeNet/" + version }
 
 const banner = "\033[36m" +
 	" ██╗   ██╗██╗██████╗ ███████╗███╗   ██╗███████╗████████╗\n" +
@@ -78,7 +83,7 @@ func main() {
 	user := *wallet + "." + *worker
 
 	fmt.Printf("   \033[36m⛏\033[0m  connecting to %s ...\n", *pool)
-	client, err := stratum.Dial(ctx, *pool, user, stratumPass, userAgent)
+	client, err := stratum.Dial(ctx, *pool, user, stratumPass, userAgent())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "   \033[31m✗\033[0m  %v\n", err)
 		os.Exit(1)
