@@ -23,6 +23,7 @@ import (
 
 	"vibenet/miner"
 	"vibenet/pair"
+	"vibenet/priority"
 	"vibenet/stratum"
 )
 
@@ -53,7 +54,17 @@ func main() {
 	threads := flag.Int("threads", runtime.NumCPU(), "Number of mining goroutines")
 	pool := flag.String("pool", defaultPool, "Stratum endpoint (host:port)")
 	mode := flag.String("mode", "auto", "Mining gate: auto (pair with active dev tools) | always | off")
+	intensity := flag.String("intensity", "low", "Process priority class: low | medium | high")
 	flag.Parse()
+
+	level, err := priority.Parse(*intensity)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+	if err := priority.Set(level); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not set priority %q: %v\n", level, err)
+	}
 
 	switch *mode {
 	case "auto", "always", "off":
@@ -75,6 +86,7 @@ func main() {
 	fmt.Printf("   \033[1mThreads\033[0m  %d\n", *threads)
 	fmt.Printf("   \033[1mPool   \033[0m  %s\n", *pool)
 	fmt.Printf("   \033[1mMode   \033[0m  %s\n", *mode)
+	fmt.Printf("   \033[1mPriority\033[0m %s\n", level)
 	fmt.Println("   ────────────────────────────────────────────────────────")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

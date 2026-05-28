@@ -125,8 +125,8 @@ Requires Go ≥ 1.21. No CGO. No external dependencies — standard library only
 - [x] Job-driven mining loop with collision-free extranonce-2 sequence
 - [x] End-to-end pool integration verified against `solo.ckpool.org`
 - [x] Auto-pairing to active development sessions (`--mode auto`, default)
+- [x] Cross-platform idle-priority enforcement (`--intensity low|medium|high`, default low)
 - [ ] Long-running share-acceptance verification at reduced pool difficulty
-- [ ] Cross-platform idle-priority enforcement (`--intensity low`)
 - [ ] Reconnect with exponential backoff
 - [ ] Signed release binaries (Windows / Linux / macOS · amd64 + arm64)
 - [ ] Optional Bitaxe USB ASIC support (Stratum passthrough)
