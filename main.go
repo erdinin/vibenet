@@ -63,7 +63,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err := priority.Set(level); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not set priority %q: %v\n", level, err)
+		fmt.Fprintf(os.Stderr, "warning: could not set priority %s: %v\n", level, err)
 	}
 
 	switch *mode {
