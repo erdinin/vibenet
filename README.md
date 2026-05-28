@@ -2,7 +2,7 @@
 
 A CPU-based Bitcoin solo miner with idle-priority workers and optional auto-pairing to active development sessions. Single static binary. Stratum v1. No custody.
 
-> **Status:** pre-release, active development. Hashing core and pool-target evaluation are implemented; Stratum v1 client and auto-pairing are in progress. See [Roadmap](#roadmap) for the current state.
+> **Status:** v0.1.0-alpha. End-to-end CPU solo mining works against `solo.ckpool.org` — Stratum v1 client, job parsing, header construction and share submission are in place. Auto-pairing to development sessions and signed release binaries are next. See [Roadmap](#roadmap) for the current state.
 
 ## What it does
 
@@ -53,7 +53,7 @@ The reason CPU solo BTC mining still exists as a category is that the *outcome* 
 
 ## Architecture
 
-```
+```text
         Stratum v1 (JSON-RPC, newline-delimited, over TCP)
 +--------------+ <---------------------------------> +-------------------+
 |   stratum/   |                                     |  solo.ckpool.org  |
@@ -79,7 +79,7 @@ The reason CPU solo BTC mining still exists as a category is that the *outcome* 
 
 The block header layout follows the canonical Bitcoin format:
 
-```
+```text
 | version (4 LE) | prev_hash (32) | merkle_root (32) | ntime (4 LE) | nbits (4 LE) | nonce (4 LE) |
 ```
 
@@ -87,7 +87,7 @@ Stratum delivers `prev_hash` as eight 32-bit words in network byte order. Each w
 
 The merkle root is computed locally:
 
-```
+```text
 coinbase   = coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2
 merkle     = SHA256d(coinbase)
 for each branch in merkle_branch:
@@ -96,7 +96,7 @@ for each branch in merkle_branch:
 
 The pool's share target is derived from the advertised difficulty `d` as:
 
-```
+```text
 target = ⌊ 0x00000000FFFF0000…00 / d ⌋        (256-bit big-endian)
 ```
 
@@ -114,17 +114,21 @@ Requires Go ≥ 1.21. No CGO. No external dependencies — standard library only
 
 ## Roadmap
 
-- [x] CPU SHA-256d hashing core (parallel workers, atomic share counter)
+- [x] CPU SHA-256d hashing core (parallel workers, atomic counters)
 - [x] Pool target derivation, hash-vs-target comparison
-- [x] Live hashrate reporter (H/s · KH/s · MH/s · GH/s)
-- [ ] Stratum v1 client (`subscribe / authorize / notify / submit / set_difficulty`)
-- [ ] Job-driven mining loop with disjoint extranonce-2 ranges
+- [x] Live hashrate reporter (H/s · KH/s · MH/s · GH/s · TH/s)
+- [x] Stratum v1 client (`subscribe / authorize / notify / submit / set_difficulty / set_extranonce`)
+- [x] Job parsing and block header construction (prev-hash byte-swap, coinbase merkle root)
+- [x] Job-driven mining loop with collision-free extranonce-2 sequence
+- [x] End-to-end pool integration verified against `solo.ckpool.org`
+- [ ] Long-running share-acceptance verification at reduced pool difficulty
 - [ ] Auto-pairing to active development sessions (`--mode auto`)
 - [ ] Cross-platform idle-priority enforcement (`--intensity low`)
 - [ ] Reconnect with exponential backoff
 - [ ] Signed release binaries (Windows / Linux / macOS · amd64 + arm64)
 - [ ] Optional Bitaxe USB ASIC support (Stratum passthrough)
 - [ ] Optional local-node mode (skip ckpool, use your own `bitcoind` with `getblocktemplate`)
+- [ ] Browser dashboard with pixel-art "mining office" (vibe-paired animation)
 
 ## Contributing
 

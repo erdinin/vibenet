@@ -1,91 +1,92 @@
-// Package miner implements the VibeNet CPU mining core.
+// Package miner is the VibeNet hashing engine.
 //
-// The Miner spins up N worker goroutines that compute double-SHA256 over an
-// 80-byte header (Bitcoin-shaped: 76-byte prefix + 4-byte nonce) using a
-// per-worker random seed, and a single reporter goroutine that prints the
-// live hashrate once per second.
-//
-// The package exposes no network or pool transport on purpose — it is the
-// hashing primitive that the rest of VibeNet (P2P layer, share submission,
-// payout accounting) is built on top of.
+// A Miner owns N worker goroutines that double-SHA256 over a block-header
+// template received from the stratum layer, iterate the 32-bit nonce, and
+// emit any hash that meets the current pool share target. The package is
+// transport-agnostic: it talks to the pool via SetJob / SetTarget /
+// Shares() rather than embedding the protocol.
 package miner
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"vibenet/stratum"
 )
 
 // Config holds the runtime parameters for a Miner.
 type Config struct {
-	Wallet  string
-	Worker  string
 	Threads int
 }
 
-// Miner is a CPU SHA-256d benchmark worker.
+// Miner spins up Threads worker goroutines and emits shares meeting the
+// current target on its Shares() channel.
 type Miner struct {
-	cfg      Config
-	hashes   atomic.Uint64
+	threads int
+
+	job          atomic.Pointer[stratum.Job]
+	shareTarget  atomic.Pointer[[32]byte]
+	enonce2Seq   atomic.Uint64
+	hashes       atomic.Uint64
+
+	shares chan stratum.Share
+
 	stopCh   chan struct{}
-	wg       sync.WaitGroup
 	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
-// New returns a Miner ready to Run.
+// New constructs a Miner; call Run to spawn workers.
 func New(cfg Config) *Miner {
 	if cfg.Threads < 1 {
 		cfg.Threads = 1
 	}
 	return &Miner{
-		cfg:    cfg,
-		stopCh: make(chan struct{}),
+		threads: cfg.Threads,
+		shares:  make(chan stratum.Share, 16),
+		stopCh:  make(chan struct{}),
 	}
 }
 
-// Run starts all worker goroutines plus the reporter and blocks until Stop is called.
+// SetJob installs a new job. Workers pick it up at the next batch boundary.
+func (m *Miner) SetJob(j *stratum.Job) { m.job.Store(j) }
+
+// SetTarget installs a new pool share target. Workers pick it up at the next
+// enonce2 boundary; the same target is captured for the lifetime of one
+// (job, enonce2) sweep so a tight inner loop reads a stack-local copy.
+func (m *Miner) SetTarget(t [32]byte) { m.shareTarget.Store(&t) }
+
+// Shares is the channel of share candidates. It closes when Run returns.
+func (m *Miner) Shares() <-chan stratum.Share { return m.shares }
+
+// Hashes returns the running total of double-SHA256 ops performed by all
+// workers since Run started.
+func (m *Miner) Hashes() uint64 { return m.hashes.Load() }
+
+// Run spawns the worker goroutines and blocks until Stop is called.
+// The shares channel is closed before Run returns.
 func (m *Miner) Run() {
-	for i := 0; i < m.cfg.Threads; i++ {
+	for i := 0; i < m.threads; i++ {
 		m.wg.Add(1)
-		go m.workerLoop(i)
+		go m.workerLoop()
 	}
-	m.wg.Add(1)
-	go m.reporter()
 	m.wg.Wait()
+	close(m.shares)
 }
 
-// Stop signals all goroutines to exit. Safe to call multiple times.
+// Stop signals workers to exit at the next batch boundary. Safe to call
+// multiple times.
 func (m *Miner) Stop() {
 	m.stopOnce.Do(func() { close(m.stopCh) })
 }
 
-// workerLoop is the hot path: tight SHA-256d loop over an incrementing nonce.
-//
-// We batch hashes between atomic adds so the counter is not the bottleneck.
-// Real pool integration would replace `header` with the current job template
-// and break out of the inner loop when target difficulty is met.
-func (m *Miner) workerLoop(id int) {
+func (m *Miner) workerLoop() {
 	defer m.wg.Done()
 
-	// 80-byte block-header-shaped buffer. Bytes 0..75 hold the (mock) prefix,
-	// bytes 76..79 hold the nonce in little-endian — same layout as Bitcoin.
-	var header [80]byte
-	if _, err := rand.Read(header[:76]); err != nil {
-		// Fallback: derive a seed from time + worker id. Good enough for
-		// benchmarking; never used in real mining.
-		binary.LittleEndian.PutUint64(header[0:8], uint64(time.Now().UnixNano()))
-		binary.LittleEndian.PutUint64(header[8:16], uint64(id))
-	}
-
-	var nonceSeed [4]byte
-	_, _ = rand.Read(nonceSeed[:])
-	nonce := binary.LittleEndian.Uint32(nonceSeed[:])
-
-	const batch = 4096
 	for {
 		select {
 		case <-m.stopCh:
@@ -93,70 +94,91 @@ func (m *Miner) workerLoop(id int) {
 		default:
 		}
 
-		for i := 0; i < batch; i++ {
-			binary.LittleEndian.PutUint32(header[76:80], nonce)
-			first := sha256.Sum256(header[:])
-			_ = sha256.Sum256(first[:]) // SHA-256d: second pass over the first digest
-			nonce++
+		j := m.job.Load()
+		tp := m.shareTarget.Load()
+		if j == nil || tp == nil {
+			// Pool hasn't delivered the first job or target yet. Wait briefly.
+			select {
+			case <-m.stopCh:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			continue
 		}
-		m.hashes.Add(batch)
+
+		enonce2 := m.nextEnonce2(j.ExtraNonce2Size)
+		m.hashSweep(j, *tp, enonce2)
 	}
 }
 
-// reporter prints a single status line per second and a summary on shutdown.
-func (m *Miner) reporter() {
-	defer m.wg.Done()
+// hashSweep iterates the full uint32 nonce space for one (job, enonce2)
+// pair, emitting shares meeting target. Returns when Stop fires, the job
+// changes, or the nonce space is exhausted.
+func (m *Miner) hashSweep(j *stratum.Job, target [32]byte, enonce2 []byte) {
+	header := j.HeaderPrefix(enonce2)
 
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	start := time.Now()
-	var lastHashes uint64
-	lastTime := start
+	const batch = 4096
+	var nonce uint32
 
 	for {
 		select {
 		case <-m.stopCh:
-			m.printSummary(start)
 			return
-
-		case now := <-ticker.C:
-			cur := m.hashes.Load()
-			delta := cur - lastHashes
-			dt := now.Sub(lastTime).Seconds()
-			rate := float64(delta) / dt
-			uptime := time.Since(start).Round(time.Second)
-
-			// \r overwrites the same terminal line for a clean live readout.
-			// Padding spaces at the end clear any leftover characters from
-			// the previous, longer line.
-			fmt.Printf("\r   \033[36m⛏\033[0m  [\033[1m%s\033[0m]  \033[32m%s\033[0m  │  total \033[90m%s\033[0m  │  up \033[90m%s\033[0m     ",
-				m.cfg.Worker,
-				formatHashrate(rate),
-				formatNumber(cur),
-				uptime,
-			)
-
-			lastHashes = cur
-			lastTime = now
+		default:
 		}
+		if m.job.Load() != j {
+			return
+		}
+
+		var i uint32
+		for i = 0; i < batch; i++ {
+			binary.LittleEndian.PutUint32(header[76:80], nonce)
+			first := sha256.Sum256(header[:])
+			hash := sha256.Sum256(first[:])
+
+			if stratum.HashLEMeetsTarget(hash, target) {
+				m.emitShare(j, enonce2, nonce)
+			}
+
+			if nonce == ^uint32(0) {
+				m.hashes.Add(uint64(i + 1))
+				return // nonce wrapped, get a fresh enonce2
+			}
+			nonce++
+		}
+		m.hashes.Add(uint64(batch))
 	}
 }
 
-func (m *Miner) printSummary(start time.Time) {
-	total := m.hashes.Load()
-	elapsed := time.Since(start)
-	avg := float64(total) / elapsed.Seconds()
-	fmt.Println()
-	fmt.Println("   ────────────────────────────────────────────────────────")
-	fmt.Printf("   total hashes : %s\n", formatNumber(total))
-	fmt.Printf("   avg hashrate : %s\n", formatHashrate(avg))
-	fmt.Printf("   elapsed      : %s\n", elapsed.Round(time.Second))
-	fmt.Printf("   wallet       : %s\n", m.cfg.Wallet)
+func (m *Miner) emitShare(j *stratum.Job, enonce2 []byte, nonce uint32) {
+	en2Copy := make([]byte, len(enonce2))
+	copy(en2Copy, enonce2)
+	select {
+	case m.shares <- stratum.Share{
+		JobID:       j.ID,
+		ExtraNonce2: en2Copy,
+		NTime:       j.NTime,
+		Nonce:       nonce,
+	}:
+	default:
+		// Channel full: a slow share-submitter is the bottleneck. Drop this
+		// share rather than stalling the hot loop. At sane pool difficulties
+		// this is unreachable.
+	}
 }
 
-// formatHashrate renders a H/s rate at a sensible scale.
-func formatHashrate(hps float64) string {
+func (m *Miner) nextEnonce2(size int) []byte {
+	v := m.enonce2Seq.Add(1) - 1
+	out := make([]byte, size)
+	for i := size - 1; i >= 0; i-- {
+		out[i] = byte(v)
+		v >>= 8
+	}
+	return out
+}
+
+// FormatHashrate renders a H/s rate at a sensible scale (H/s..TH/s).
+func FormatHashrate(hps float64) string {
 	switch {
 	case hps >= 1e12:
 		return fmt.Sprintf("%7.2f TH/s", hps/1e12)
@@ -171,8 +193,8 @@ func formatHashrate(hps float64) string {
 	}
 }
 
-// formatNumber prints n with thousands separators.
-func formatNumber(n uint64) string {
+// FormatNumber prints n with thousands separators.
+func FormatNumber(n uint64) string {
 	s := fmt.Sprintf("%d", n)
 	if len(s) <= 3 {
 		return s
