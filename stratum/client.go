@@ -11,6 +11,7 @@ package stratum
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,10 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// ErrClosed is returned by in-flight RPC calls when the underlying connection
+// is terminated before a response arrives.
+var ErrClosed = errors.New("stratum: connection closed")
 
 // MiningNotify is a parsed mining.notify notification — a complete job
 // template the miner must work on.
@@ -328,8 +333,8 @@ func (c *Client) Submit(ctx context.Context, worker string, s Share) (accepted b
 		worker,
 		s.JobID,
 		hex.EncodeToString(s.ExtraNonce2),
-		hex.EncodeToString(uint32BE(s.NTime)),
-		hex.EncodeToString(uint32BE(s.Nonce)),
+		hex.EncodeToString(binary.BigEndian.AppendUint32(nil, s.NTime)),
+		hex.EncodeToString(binary.BigEndian.AppendUint32(nil, s.Nonce)),
 	})
 	if err != nil {
 		return false, "", err
@@ -349,6 +354,10 @@ func (c *Client) call(ctx context.Context, method string, params []interface{}) 
 	ch := make(chan rpcResponse, 1)
 
 	c.pendingMu.Lock()
+	if c.closed.Load() {
+		c.pendingMu.Unlock()
+		return rpcResponse{}, ErrClosed
+	}
 	c.pending[id] = ch
 	c.pendingMu.Unlock()
 
@@ -365,7 +374,10 @@ func (c *Client) call(ctx context.Context, method string, params []interface{}) 
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
 		return rpcResponse{}, ctx.Err()
-	case resp := <-ch:
+	case resp, ok := <-ch:
+		if !ok {
+			return rpcResponse{}, ErrClosed
+		}
 		return resp, nil
 	}
 }
@@ -405,18 +417,20 @@ func (c *Client) CurrentDifficulty() float64 {
 	return 0
 }
 
-// Close terminates the underlying connection. Safe to call multiple times.
+// Close terminates the underlying connection and fails any in-flight RPC
+// calls with ErrClosed. Safe to call multiple times.
 func (c *Client) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	return c.conn.Close()
-}
-
-// uint32BE returns n as 4 big-endian bytes. Stratum submits ntime and nonce
-// as big-endian hex even though they appear little-endian in the block header.
-func uint32BE(n uint32) []byte {
-	return []byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+	err := c.conn.Close()
+	c.pendingMu.Lock()
+	for id, ch := range c.pending {
+		close(ch)
+		delete(c.pending, id)
+	}
+	c.pendingMu.Unlock()
+	return err
 }
 
 // protocolError converts a JSON-RPC error payload into a Go error. Returns nil
